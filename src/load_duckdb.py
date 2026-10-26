@@ -9,8 +9,23 @@ def get_duckdb_connection(db_path=DB_PATH):
 
 def create_raw_tables(conn):
     """Creates the raw_video_snapshots table if it doesn't already exist."""
-    # (DDL query here)
-    pass
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS raw_video_snapshots (
+            snapshot_id VARCHAR,
+            video_id VARCHAR,
+            channel_id VARCHAR,
+            channel_title VARCHAR,
+            video_title VARCHAR,
+            published_at TIMESTAMP,
+            view_count BIGINT,
+            like_count BIGINT,
+            comment_count BIGINT,
+            extracted_at TIMESTAMP,
+            loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
 
 def load_snapshots(conn, file_path="data/staged/snapshots.jsonl"):
     """Loads staged JSONL data directly into raw_video_snapshots."""
