@@ -27,10 +27,28 @@ def create_raw_tables(conn):
         """
     )
 
+
 def load_snapshots(conn, file_path="data/staged/snapshots.jsonl"):
     """Loads staged JSONL data directly into raw_video_snapshots."""
-    # (INSERT INTO ... SELECT FROM read_json_auto query here)
-    pass
+
+    conn.execute(
+    f"""INSERT INTO raw_video_snapshots (
+    snapshot_id, video_id, channel_id, channel_title, video_title,
+    published_at, view_count, like_count, comment_count, extracted_at, loaded_at
+    )
+    SELECT 
+        snapshot_id,
+        video_id,
+        channel_id,
+        channel_title,
+        video_title,
+        published_at::TIMESTAMP,
+        view_count::BIGINT,
+        like_count::BIGINT,
+        comment_count::BIGINT,
+        extracted_at::TIMESTAMP,
+        CURRENT_TIMESTAMP AS loaded_at
+    FROM read_json_auto('{file_path}')""")
 
 def run_load_pipeline(source_file="data/staged/snapshots.jsonl"):
     """Main entrypoint called by Airflow and Streamlit."""
@@ -39,4 +57,15 @@ def run_load_pipeline(source_file="data/staged/snapshots.jsonl"):
     # 3. create_raw_tables(conn)
     # 4. load_snapshots(conn, source_file)
     # 5. Close connection
-    pass
+
+    if not os.path.exists(source_file):
+        raise FileNotFoundError(f"Staged file not found: {source_file}")
+
+    conn = get_duckdb_connection()
+    try:
+        create_raw_tables(conn)
+        load_snapshots(conn, source_file)
+        print(f"Successfully loaded {source_file} into raw_video_snapshots.")
+    finally:
+        conn.close()
+
