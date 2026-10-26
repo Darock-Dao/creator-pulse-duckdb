@@ -1,0 +1,473 @@
+import os
+import sys
+from datetime import datetime
+import pandas as pd
+import streamlit as st
+import altair as alt
+from dotenv import load_dotenv
+
+# Ensure project root is in sys.path so we can import src modules
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+
+from src import load_snowflake, fetch_youtube
+
+# ---------------------------------------------------------
+# Page Configuration & Styling
+# ---------------------------------------------------------
+st.set_page_config(
+    page_title="CreatorPulse | Velocity & Growth Intelligence",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom sleek CSS
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #1E232F;
+        border: 1px solid #2D3748;
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 12px;
+    }
+    .stMetric label {
+        font-size: 0.82rem !important;
+        color: #A0AEC0 !important;
+        white-space: nowrap !important;
+    }
+    .stMetric div[data-testid="stMetricValue"] {
+        font-size: 1.35rem !important;
+        font-weight: 700 !important;
+        white-space: nowrap !important;
+    }
+    div[data-testid="stSidebar"] button[kind="secondary"] {
+        padding: 2px 8px;
+        font-size: 0.8rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------
+# Cached Snowflake Data Access
+# ---------------------------------------------------------
+@st.cache_data(ttl=30)
+def get_channel_metrics():
+    """Fetches channel-level summary KPIs for active creators."""
+    conn = load_snowflake.get_snowflake_connection()
+    try:
+        query = """
+        SELECT 
+            m.channel_id,
+            m.channel_title,
+            w.channel_handle,
+            m.total_tracked_videos,
+            m.total_views,
+            m.total_likes,
+            m.total_comments,
+            m.engagement_rate,
+            m.max_hourly_velocity,
+            m.avg_hourly_velocity,
+            m.latest_snapshot_at
+        FROM RAW.MART_CHANNEL_PERFORMANCE m
+        INNER JOIN RAW.WATCHLIST w ON m.channel_id = w.channel_id
+        WHERE w.is_active = TRUE
+        ORDER BY m.total_views DESC;
+        """
+        df = pd.read_sql(query, conn)
+        df.columns = [col.upper() for col in df.columns]
+        if not df.empty:
+            df["DISPLAY_NAME"] = df["CHANNEL_TITLE"] + " (" + df["CHANNEL_HANDLE"] + ")"
+        return df
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=30)
+def get_video_velocities(channel_id=None):
+    """Fetches time-series snapshot and velocity data from fact table."""
+    conn = load_snowflake.get_snowflake_connection()
+    try:
+        where_clause = f"WHERE channel_id = '{channel_id}'" if channel_id else ""
+        query = f"""
+        SELECT 
+            snapshot_id,
+            video_id,
+            channel_id,
+            channel_title,
+            video_title,
+            published_at,
+            view_count,
+            prev_view_count,
+            delta_views,
+            hours_between_snapshots,
+            hourly_velocity,
+            video_age_hours,
+            extracted_at
+        FROM RAW.FCT_VIDEO_VELOCITY
+        {where_clause}
+        ORDER BY extracted_at ASC;
+        """
+        df = pd.read_sql(query, conn)
+        df.columns = [col.upper() for col in df.columns]
+        if not df.empty:
+            df['EXTRACTED_AT'] = pd.to_datetime(df['EXTRACTED_AT'])
+            df['PUBLISHED_AT'] = pd.to_datetime(df['PUBLISHED_AT'])
+        return df
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=30)
+def get_watchlist(active_only=True):
+    """Fetches creators from the Watchlist table."""
+    conn = load_snowflake.get_snowflake_connection()
+    try:
+        where_clause = "WHERE is_active = TRUE" if active_only else ""
+        query = f"SELECT channel_id, channel_handle, channel_title, added_at, is_active FROM RAW.WATCHLIST {where_clause} ORDER BY added_at DESC;"
+        df = pd.read_sql(query, conn)
+        df.columns = [col.upper() for col in df.columns]
+        return df
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+def add_channel_to_watchlist(handle):
+    """Resolves a channel handle via YouTube API and adds it to Snowflake watchlist."""
+    import googleapiclient.discovery
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=api_key)
+    
+    channel_details = fetch_youtube.get_channel_details(youtube, handle)
+    if not channel_details:
+        raise ValueError(f"Could not find YouTube channel for handle '{handle}'")
+    
+    conn = load_snowflake.get_snowflake_connection()
+    try:
+        cursor = conn.cursor()
+        upsert_query = f"""
+        MERGE INTO RAW.WATCHLIST AS target
+        USING (SELECT 
+            '{channel_details['channel_id']}' AS channel_id,
+            '{handle}' AS channel_handle,
+            '{channel_details['channel_title'].replace("'", "''")}' AS channel_title
+        ) AS source
+        ON target.channel_id = source.channel_id
+        WHEN MATCHED THEN
+            UPDATE SET channel_handle = source.channel_handle, is_active = TRUE
+        WHEN NOT MATCHED THEN
+            INSERT (channel_id, channel_handle, channel_title, is_active)
+            VALUES (source.channel_id, source.channel_handle, source.channel_title, TRUE);
+        """
+        cursor.execute(upsert_query)
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
+        
+    return channel_details
+
+
+def deactivate_channel(channel_id):
+    """Soft-deletes (deactivates) a creator in the Snowflake Watchlist."""
+    conn = load_snowflake.get_snowflake_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE RAW.WATCHLIST SET is_active = FALSE WHERE channel_id = '{channel_id}';")
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------
+# Sidebar: Watchlist & Pipeline Controls
+# ---------------------------------------------------------
+with st.sidebar:
+    st.title("⚡ CreatorPulse")
+    st.markdown("---")
+    
+    st.subheader("📋 Track New Creator")
+    new_handle = st.text_input("YouTube Handle", placeholder="@mkbhd or @penguinz0")
+    if st.button("➕ Add to Watchlist", use_container_width=True):
+        if new_handle:
+            clean_handle = new_handle.strip()
+            if not clean_handle.startswith("@"):
+                clean_handle = f"@{clean_handle}"
+            with st.spinner(f"Resolving {clean_handle}..."):
+                try:
+                    info = add_channel_to_watchlist(clean_handle)
+                    st.success(f"Added **{info['channel_title']}** to Watchlist!")
+                    # Ingest initial data for the new creator
+                    fetch_youtube.run_fetch_pipeline(handle=clean_handle)
+                    load_snowflake.run_load_pipeline()
+                    
+                    with st.spinner("Analyzing channel metrics..."):
+                        import subprocess
+                        dbt_bin = os.path.join(PROJECT_ROOT, ".venv", "bin", "dbt")
+                        transform_dir = os.path.join(PROJECT_ROOT, "transform")
+                        subprocess.run(
+                            [dbt_bin, "run", "--profiles-dir", "."],
+                            cwd=transform_dir,
+                            env=dict(os.environ),
+                            check=True
+                        )
+                    
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error adding channel: {e}")
+        else:
+            st.warning("Please enter a valid channel handle.")
+
+    st.markdown("---")
+    st.subheader("👥 Active Watchlist")
+    watchlist_df = get_watchlist(active_only=True)
+    if not watchlist_df.empty:
+        for _, row in watchlist_df.iterrows():
+            c_info, c_btn = st.columns([4, 1])
+            c_info.markdown(f"**{row['CHANNEL_TITLE']}**  \n<span style='color: #718096; font-size: 0.85rem;'>{row['CHANNEL_HANDLE']}</span>", unsafe_allow_html=True)
+            if c_btn.button("✖", key=f"untrack_{row['CHANNEL_ID']}", help=f"Stop tracking {row['CHANNEL_TITLE']}"):
+                deactivate_channel(row['CHANNEL_ID'])
+                st.cache_data.clear()
+                st.rerun()
+    else:
+        st.caption("No creators currently active.")
+
+    st.markdown("---")
+    st.subheader("⚙️ Live Sync")
+    
+    if st.button("🚀 Check Live Stats Now", use_container_width=True, help="Fetches current views from YouTube for all active creators and updates growth rates."):
+        with st.spinner("1/2 Fetching latest stats from YouTube..."):
+            try:
+                import subprocess
+                active_watchlist = get_watchlist(active_only=True)
+                handles = active_watchlist["CHANNEL_HANDLE"].tolist() if not active_watchlist.empty else ["@mkbhd"]
+                for handle in handles:
+                    fetch_youtube.run_fetch_pipeline(handle=handle)
+                    load_snowflake.run_load_pipeline()
+
+                with st.spinner("2/2 Calculating growth rates & trends..."):
+                    dbt_bin = os.path.join(PROJECT_ROOT, ".venv", "bin", "dbt")
+                    transform_dir = os.path.join(PROJECT_ROOT, "transform")
+                    subprocess.run(
+                        [dbt_bin, "run", "--profiles-dir", "."],
+                        cwd=transform_dir,
+                        env=dict(os.environ),
+                        check=True
+                    )
+                
+                st.success("🎉 Latest stats and growth trends updated!")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
+
+    if st.button("🔄 Refresh Display", use_container_width=True, help="Reloads cached dashboard metrics."):
+        st.cache_data.clear()
+        st.rerun()
+        
+
+# ---------------------------------------------------------
+# Main Dashboard View
+# ---------------------------------------------------------
+st.title("📊 CreatorPulse Dashboard")
+
+channel_df = get_channel_metrics()
+
+if channel_df.empty:
+    st.info("No active creators found in your Watchlist. Add a channel in the sidebar to start tracking!")
+    st.stop()
+
+# Creator Selection Dropdown with Name + Handle
+creator_display_list = channel_df["DISPLAY_NAME"].tolist()
+selected_display = st.selectbox("Select Creator to Inspect:", options=creator_display_list)
+
+# Filter channel metrics
+current_creator_row = channel_df[channel_df["DISPLAY_NAME"] == selected_display].iloc[0]
+channel_id = current_creator_row["CHANNEL_ID"]
+
+# ---------------------------------------------------------
+# Top Metric Cards (Executive Overview)
+# ---------------------------------------------------------
+total_views = current_creator_row["TOTAL_VIEWS"]
+engagement_rate = current_creator_row["ENGAGEMENT_RATE"]
+max_vel = current_creator_row["MAX_HOURLY_VELOCITY"]
+avg_vel = current_creator_row["AVG_HOURLY_VELOCITY"]
+total_videos = current_creator_row["TOTAL_TRACKED_VIDEOS"]
+last_updated = current_creator_row["LATEST_SNAPSHOT_AT"]
+
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    st.metric(
+        label="Total Tracked Views",
+        value=f"{total_views:,.0f}" if pd.notnull(total_views) else "0",
+        help="Cumulative views across all tracked uploads."
+    )
+
+with col2:
+    st.metric(
+        label="Audience Engagement",
+        value=f"{engagement_rate:.2f}%" if pd.notnull(engagement_rate) else "0.00%",
+        help="Percentage of viewers who liked or commented: (Likes + Comments) ÷ Views."
+    )
+
+with col3:
+    vel_display = f"{max_vel:,.0f}" if pd.notnull(max_vel) and max_vel > 0 else "Calibrating..."
+    st.metric(
+        label="Peak Velocity (views/hr)",
+        value=vel_display,
+        help="Fastest view gain rate observed across recent tracking intervals."
+    )
+
+with col4:
+    avg_vel_display = f"{avg_vel:,.0f}" if pd.notnull(avg_vel) and avg_vel > 0 else "Calibrating..."
+    st.metric(
+        label="Avg Velocity (views/hr)",
+        value=avg_vel_display,
+        help="Average views gained per hour across all recent uploads."
+    )
+
+with col5:
+    st.metric(
+        label="Active Videos Tracked",
+        value=f"{total_videos}",
+        help="Number of recent video uploads actively tracked."
+    )
+
+st.markdown("---")
+
+# ---------------------------------------------------------
+# Visualizations: Growth Curves & Velocity
+# ---------------------------------------------------------
+velocity_df = get_video_velocities(channel_id=channel_id)
+
+tab1, tab2, tab3 = st.tabs(["📈 View Growth", "⚡ Momentum & Spikes", "📋 Video Performance History"])
+
+with tab1:
+    st.subheader("Views Over Time")
+    st.caption("How total views have climbed across video uploads. Use the filters below to focus on specific videos or time windows.")
+    
+    if not velocity_df.empty:
+        all_videos = velocity_df["VIDEO_TITLE"].unique().tolist()
+        
+        col_f1, col_f2 = st.columns([3, 1])
+        with col_f1:
+            selected_videos = st.multiselect(
+                "Filter Videos to Compare:",
+                options=all_videos,
+                default=all_videos,
+                help="Select or remove videos. Deselecting older videos automatically expands the chart's time axis for recent uploads."
+            )
+        with col_f2:
+            time_filter = st.selectbox(
+                "Time Window:",
+                options=["All Time", "Past 24 Hours", "Past 7 Days", "Past 14 Days"],
+                index=0,
+                help="Filter data to a specific recent time horizon."
+            )
+            
+        filtered_chart_df = velocity_df.copy()
+        
+        # Apply video selection filter
+        if selected_videos:
+            filtered_chart_df = filtered_chart_df[filtered_chart_df["VIDEO_TITLE"].isin(selected_videos)]
+        else:
+            st.info("Please select at least one video to display.")
+            filtered_chart_df = pd.DataFrame()
+            
+        # Apply time window filter
+        if not filtered_chart_df.empty and time_filter != "All Time":
+            now_utc = datetime.utcnow()
+            if time_filter == "Past 24 Hours":
+                cutoff = now_utc - pd.Timedelta(hours=24)
+            elif time_filter == "Past 7 Days":
+                cutoff = now_utc - pd.Timedelta(days=7)
+            elif time_filter == "Past 14 Days":
+                cutoff = now_utc - pd.Timedelta(days=14)
+            filtered_chart_df = filtered_chart_df[filtered_chart_df["EXTRACTED_AT"] >= cutoff]
+            
+        if not filtered_chart_df.empty:
+            chart = alt.Chart(filtered_chart_df).mark_line(point=alt.OverlayMarkDef(filled=True, size=50)).encode(
+                x=alt.X("EXTRACTED_AT:T", title="Recorded Time (UTC)", axis=alt.Axis(format="%b %d, %H:%M")),
+                y=alt.Y("VIEW_COUNT:Q", title="Total Views", scale=alt.Scale(zero=False)),
+                color=alt.Color("VIDEO_TITLE:N", legend=alt.Legend(title="Video Title", orient="bottom")),
+                tooltip=[
+                    alt.Tooltip("VIDEO_TITLE:N", title="Video"),
+                    alt.Tooltip("VIEW_COUNT:Q", title="Total Views", format=","),
+                    alt.Tooltip("DELTA_VIEWS:Q", title="Views Gained", format="+,"),
+                    alt.Tooltip("HOURLY_VELOCITY:Q", title="Views / Hour", format=",.1f"),
+                    alt.Tooltip("EXTRACTED_AT:T", title="Recorded At (UTC)", format="%Y-%m-%d %H:%M")
+                ]
+            ).properties(
+                height=420
+            ).interactive()
+            
+            st.altair_chart(chart, use_container_width=True)
+            st.caption("💡 Tip: Click and drag to pan across time, or scroll mouse wheel over the chart to zoom in.")
+        elif selected_videos:
+            st.info(f"No snapshot points found within '{time_filter}'. Switch to 'All Time' or select other videos.")
+    else:
+        st.info("No tracking history available yet.")
+
+with tab2:
+    st.subheader("Current Video Momentum (Views / Hour)")
+    st.caption("How quickly each video is currently gaining views per hour.")
+    
+    # Filter to latest snapshot for each video to show current velocity
+    latest_velocities = velocity_df.sort_values("EXTRACTED_AT").groupby("VIDEO_ID").last().reset_index()
+    valid_velocities = latest_velocities[latest_velocities["HOURLY_VELOCITY"].notnull()]
+    
+    if not valid_velocities.empty:
+        bar_chart = alt.Chart(valid_velocities).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+            x=alt.X("HOURLY_VELOCITY:Q", title="Current Speed (views / hour)"),
+            y=alt.Y("VIDEO_TITLE:N", sort="-x", title="Video Title"),
+            color=alt.Color("HOURLY_VELOCITY:Q", scale=alt.Scale(scheme="goldorange"), legend=None),
+            tooltip=[
+                alt.Tooltip("VIDEO_TITLE:N", title="Video"),
+                alt.Tooltip("HOURLY_VELOCITY:Q", title="Current Speed (views/hr)", format=",.1f"),
+                alt.Tooltip("DELTA_VIEWS:Q", title="Views Gained", format="+,"),
+                alt.Tooltip("VIEW_COUNT:Q", title="Total Views", format=","),
+                alt.Tooltip("HOURS_BETWEEN_SNAPSHOTS:Q", title="Time Elapsed (hrs)", format=",.2f")
+            ]
+        ).properties(
+            height=320
+        )
+        st.altair_chart(bar_chart, use_container_width=True)
+    else:
+        st.info("Momentum requires at least two checks to calculate hourly speed. Once another check is recorded, momentum bars will appear here!")
+
+with tab3:
+    st.subheader("Video Performance History")
+    st.caption("Detailed view logs and hourly speed recorded for each video.")
+    
+    if not velocity_df.empty:
+        display_cols = [
+            "VIDEO_TITLE", "VIEW_COUNT", "PREV_VIEW_COUNT", 
+            "DELTA_VIEWS", "HOURS_BETWEEN_SNAPSHOTS", "HOURLY_VELOCITY", "VIDEO_AGE_HOURS", "EXTRACTED_AT"
+        ]
+        st.dataframe(
+            velocity_df[display_cols].sort_values("EXTRACTED_AT", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "VIDEO_TITLE": st.column_config.TextColumn("Video Title"),
+                "VIEW_COUNT": st.column_config.NumberColumn("Total Views", format="%d views"),
+                "PREV_VIEW_COUNT": st.column_config.NumberColumn("Previous Views", format="%d views"),
+                "DELTA_VIEWS": st.column_config.NumberColumn("Views Gained", format="+%d views"),
+                "HOURS_BETWEEN_SNAPSHOTS": st.column_config.NumberColumn("Time Elapsed", format="%.2f hrs"),
+                "HOURLY_VELOCITY": st.column_config.NumberColumn("Speed (views/hr)", format="%.1f"),
+                "VIDEO_AGE_HOURS": st.column_config.NumberColumn("Video Age", format="%d hrs"),
+                "EXTRACTED_AT": st.column_config.DatetimeColumn("Recorded At", format="YYYY-MM-DD HH:mm:ss"),
+            }
+        )
+    else:
+        st.write("No video records found.")
