@@ -1,0 +1,27 @@
+import os
+import duckdb
+
+DB_PATH = "data/creator_pulse.duckdb"
+
+def get_duckdb_connection(db_path=DB_PATH):
+    """Establishes and returns a connection to the local DuckDB database."""
+    return duckdb.connect(db_path)
+
+def create_raw_tables(conn):
+    """Creates the raw_video_snapshots table if it doesn't already exist."""
+    # (DDL query here)
+    pass
+
+def load_snapshots(conn, file_path="data/staged/snapshots.jsonl"):
+    """Loads staged JSONL data directly into raw_video_snapshots."""
+    # (INSERT INTO ... SELECT FROM read_json_auto query here)
+    pass
+
+def run_load_pipeline(source_file="data/staged/snapshots.jsonl"):
+    """Main entrypoint called by Airflow and Streamlit."""
+    # 1. Check if source_file exists
+    # 2. Get connection
+    # 3. create_raw_tables(conn)
+    # 4. load_snapshots(conn, source_file)
+    # 5. Close connection
+    pass
