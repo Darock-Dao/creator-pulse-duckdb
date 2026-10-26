@@ -10,7 +10,7 @@ SELECT
     COALESCE(comment_count, 0) AS comment_count,
     extracted_at,
     loaded_at
-FROM CREATOR_PULSE_DEV.RAW.VIDEO_SNAPSHOTS
+FROM raw_video_snapshots
 QUALIFY ROW_NUMBER() OVER (
     PARTITION BY video_id, extracted_at 
     ORDER BY loaded_at DESC

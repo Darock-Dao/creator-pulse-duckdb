@@ -8,7 +8,7 @@ load_dotenv()
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-from src import fetch_youtube, load_snowflake
+from src import fetch_youtube, load_duckdb
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -30,7 +30,7 @@ with DAG (
         "retry_delay": timedelta(minutes=5),    # Backoff time before retrying
     },
     description="Entire data pipeline for extracting YouTube data,"
-                "copying to Snowflake,"
+                "loading into DuckDB,"
                 "running DBT transformations and tests.",
     schedule="0 */6 * * *",       # Cron expression (every 6 hours)
     start_date=datetime(2026, 1, 1),        # Fixed start date in the past
@@ -43,9 +43,9 @@ with DAG (
         python_callable=fetch_youtube.run_fetch_pipeline,  # The Python function to call
     )
 
-    load_snowflake_task = PythonOperator(
-        task_id="load_snowflake",
-        python_callable=load_snowflake.run_load_pipeline,  
+    load_duckdb_task = PythonOperator(
+        task_id="load_duckdb",
+        python_callable=load_duckdb.run_load_pipeline,  
     )
 
     dbt_run_task = BashOperator(
@@ -58,4 +58,4 @@ with DAG (
         bash_command=bash_test_command
     )
 
-    fetch_youtube_task >> load_snowflake_task >> dbt_run_task >> dbt_test_task
+    fetch_youtube_task >> load_duckdb_task >> dbt_run_task >> dbt_test_task
