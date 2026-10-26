@@ -13,7 +13,7 @@ if PROJECT_ROOT not in sys.path:
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
-from src import load_snowflake, fetch_youtube
+from src import load_duckdb, fetch_youtube
 
 # ---------------------------------------------------------
 # Page Configuration & Styling
@@ -54,12 +54,12 @@ st.markdown("""
 
 
 # ---------------------------------------------------------
-# Cached Snowflake Data Access
+# Cached DuckDB Data Access
 # ---------------------------------------------------------
 @st.cache_data(ttl=30)
 def get_channel_metrics():
     """Fetches channel-level summary KPIs for active creators."""
-    conn = load_snowflake.get_snowflake_connection()
+    conn = load_duckdb.get_duckdb_connection(read_only=True)
     try:
         query = """
         SELECT 
@@ -74,12 +74,12 @@ def get_channel_metrics():
             m.max_hourly_velocity,
             m.avg_hourly_velocity,
             m.latest_snapshot_at
-        FROM RAW.MART_CHANNEL_PERFORMANCE m
-        INNER JOIN RAW.WATCHLIST w ON m.channel_id = w.channel_id
+        FROM mart_channel_performance m
+        INNER JOIN watchlist w ON m.channel_id = w.channel_id
         WHERE w.is_active = TRUE
         ORDER BY m.total_views DESC;
         """
-        df = pd.read_sql(query, conn)
+        df = conn.execute(query).df()
         df.columns = [col.upper() for col in df.columns]
         if not df.empty:
             df["DISPLAY_NAME"] = df["CHANNEL_TITLE"] + " (" + df["CHANNEL_HANDLE"] + ")"
@@ -91,7 +91,7 @@ def get_channel_metrics():
 @st.cache_data(ttl=30)
 def get_video_velocities(channel_id=None):
     """Fetches time-series snapshot and velocity data from fact table."""
-    conn = load_snowflake.get_snowflake_connection()
+    conn = load_duckdb.get_duckdb_connection(read_only=True)
     try:
         where_clause = f"WHERE channel_id = '{channel_id}'" if channel_id else ""
         query = f"""
@@ -109,11 +109,11 @@ def get_video_velocities(channel_id=None):
             hourly_velocity,
             video_age_hours,
             extracted_at
-        FROM RAW.FCT_VIDEO_VELOCITY
+        FROM fct_video_velocity
         {where_clause}
         ORDER BY extracted_at ASC;
         """
-        df = pd.read_sql(query, conn)
+        df = conn.execute(query).df()
         df.columns = [col.upper() for col in df.columns]
         if not df.empty:
             df['EXTRACTED_AT'] = pd.to_datetime(df['EXTRACTED_AT'])
@@ -126,11 +126,11 @@ def get_video_velocities(channel_id=None):
 @st.cache_data(ttl=30)
 def get_watchlist(active_only=True):
     """Fetches creators from the Watchlist table."""
-    conn = load_snowflake.get_snowflake_connection()
+    conn = load_duckdb.get_duckdb_connection(read_only=True)
     try:
         where_clause = "WHERE is_active = TRUE" if active_only else ""
-        query = f"SELECT channel_id, channel_handle, channel_title, added_at, is_active FROM RAW.WATCHLIST {where_clause} ORDER BY added_at DESC;"
-        df = pd.read_sql(query, conn)
+        query = f"SELECT channel_id, channel_handle, channel_title, added_at, is_active FROM watchlist {where_clause} ORDER BY added_at DESC;"
+        df = conn.execute(query).df()
         df.columns = [col.upper() for col in df.columns]
         return df
     except Exception:
@@ -140,7 +140,7 @@ def get_watchlist(active_only=True):
 
 
 def add_channel_to_watchlist(handle):
-    """Resolves a channel handle via YouTube API and adds it to Snowflake watchlist."""
+    """Resolves a channel handle via YouTube API and adds it to DuckDB watchlist."""
     import googleapiclient.discovery
     api_key = os.getenv("YOUTUBE_API_KEY")
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=api_key)
@@ -149,26 +149,18 @@ def add_channel_to_watchlist(handle):
     if not channel_details:
         raise ValueError(f"Could not find YouTube channel for handle '{handle}'")
     
-    conn = load_snowflake.get_snowflake_connection()
+    conn = load_duckdb.get_duckdb_connection()
     try:
-        cursor = conn.cursor()
-        upsert_query = f"""
-        MERGE INTO RAW.WATCHLIST AS target
-        USING (SELECT 
-            '{channel_details['channel_id']}' AS channel_id,
-            '{handle}' AS channel_handle,
-            '{channel_details['channel_title'].replace("'", "''")}' AS channel_title
-        ) AS source
-        ON target.channel_id = source.channel_id
-        WHEN MATCHED THEN
-            UPDATE SET channel_handle = source.channel_handle, is_active = TRUE
-        WHEN NOT MATCHED THEN
-            INSERT (channel_id, channel_handle, channel_title, is_active)
-            VALUES (source.channel_id, source.channel_handle, source.channel_title, TRUE);
+        load_duckdb.create_raw_tables(conn)
+        upsert_query = """
+        INSERT INTO watchlist (channel_id, channel_handle, channel_title, is_active)
+        VALUES (?, ?, ?, TRUE)
+        ON CONFLICT (channel_id) DO UPDATE SET
+            channel_handle = EXCLUDED.channel_handle,
+            channel_title = EXCLUDED.channel_title,
+            is_active = TRUE;
         """
-        cursor.execute(upsert_query)
-        conn.commit()
-        cursor.close()
+        conn.execute(upsert_query, [channel_details['channel_id'], handle, channel_details['channel_title']])
     finally:
         conn.close()
         
@@ -176,13 +168,10 @@ def add_channel_to_watchlist(handle):
 
 
 def deactivate_channel(channel_id):
-    """Soft-deletes (deactivates) a creator in the Snowflake Watchlist."""
-    conn = load_snowflake.get_snowflake_connection()
+    """Soft-deletes (deactivates) a creator in the DuckDB Watchlist."""
+    conn = load_duckdb.get_duckdb_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(f"UPDATE RAW.WATCHLIST SET is_active = FALSE WHERE channel_id = '{channel_id}';")
-        conn.commit()
-        cursor.close()
+        conn.execute("UPDATE watchlist SET is_active = FALSE WHERE channel_id = ?;", [channel_id])
     finally:
         conn.close()
 
@@ -207,7 +196,7 @@ with st.sidebar:
                     st.success(f"Added **{info['channel_title']}** to Watchlist!")
                     # Ingest initial data for the new creator
                     fetch_youtube.run_fetch_pipeline(handle=clean_handle)
-                    load_snowflake.run_load_pipeline()
+                    load_duckdb.run_load_pipeline()
                     
                     with st.spinner("Analyzing channel metrics..."):
                         import subprocess
@@ -252,7 +241,7 @@ with st.sidebar:
                 handles = active_watchlist["CHANNEL_HANDLE"].tolist() if not active_watchlist.empty else ["@mkbhd"]
                 for handle in handles:
                     fetch_youtube.run_fetch_pipeline(handle=handle)
-                    load_snowflake.run_load_pipeline()
+                    load_duckdb.run_load_pipeline()
 
                 with st.spinner("2/2 Calculating growth rates & trends..."):
                     dbt_bin = os.path.join(PROJECT_ROOT, ".venv", "bin", "dbt")
@@ -263,6 +252,7 @@ with st.sidebar:
                         env=dict(os.environ),
                         check=True
                     )
+
                 
                 st.success("🎉 Latest stats and growth trends updated!")
                 st.cache_data.clear()

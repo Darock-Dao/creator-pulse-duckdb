@@ -3,7 +3,7 @@ version: '1.0.0'
 config-version: 2
 
 # This points to the profile name in profiles.yml
-profile: 'creator_pulse_snowflake'
+profile: 'creator_pulse_dbt'
 
 model-paths: ["models"]
 test-paths: ["tests"]
